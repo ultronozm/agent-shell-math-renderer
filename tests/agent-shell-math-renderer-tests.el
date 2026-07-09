@@ -387,6 +387,104 @@ E=mc^2
     (should (equal (nreverse calls)
                    '((1 6 "A") (15 21 "B"))))))
 
+(ert-deftest agent-shell-math-renderer-async-overlay-recovers-stale-marker ()
+  ;; The render hook runs before markdown rewrites such as bold.  If an
+  ;; equation image is not cached yet, the async compile stores markers for
+  ;; the raw math span; a later markdown rewrite can delete/reinsert that
+  ;; text, leaving the markers stale even though the math source properties
+  ;; were copied to the rewritten text.  Compile completion must recover by
+  ;; finding that source run rather than silently leaving raw math behind.
+  (with-temp-buffer
+    (insert "prefix \\(x\\) suffix")
+    (let (start end)
+      (goto-char (point-min))
+      (search-forward "\\(")
+      (setq start (match-beginning 0))
+      (search-forward "\\)")
+      (setq end (match-end 0))
+      (add-text-properties
+       start end
+       '(agent-shell-math-renderer-source "x"
+         agent-shell-math-renderer-inline t))
+      ;; Simulate an invalidated pending marker pair.
+      (should-not
+       (agent-shell-math-renderer--overlay-image-if-source
+        (current-buffer) (point-min) (point-min) "x" t 'fake-image))
+      (should
+       (agent-shell-math-renderer--overlay-matching-source-regions
+        (current-buffer) "x" t 'fake-image))
+      (should (eq (get-text-property start 'display) 'fake-image)))))
+
+(ert-deftest agent-shell-math-renderer-render-skips-known-failed-key ()
+  ;; A bad source candidate can be rediscovered on refresh.  Once its cache
+  ;; key has failed in this Emacs session, rendering should not reschedule the
+  ;; same doomed compile and emit the same warning again.
+  (let ((agent-shell-math-renderer--failed (make-hash-table :test 'equal))
+        (scheduled nil))
+    (puthash (agent-shell-math-renderer--cache-key "bad" t)
+             t agent-shell-math-renderer--failed)
+    (cl-letf (((symbol-function 'agent-shell-math-renderer--renderable-p)
+               (lambda () t))
+              ((symbol-function 'agent-shell-math-renderer--tools-available-p)
+               (lambda () t))
+              ((symbol-function 'agent-shell-math-renderer--cached-image)
+               (lambda (_key) nil))
+              ((symbol-function 'agent-shell-math-renderer--schedule)
+               (lambda (&rest _args) (setq scheduled t))))
+      (with-temp-buffer
+        (insert "\\(bad\\)")
+        (agent-shell-math-renderer--render
+         (current-buffer) (point-min) (point-max) "bad" t)))
+    (should-not scheduled)))
+
+(ert-deftest agent-shell-math-renderer-render-hook-recovers-open-block ()
+  ;; If agent-shell's next incremental markdown pass is narrowed after a
+  ;; display-math opener that we froze while streaming, the buffer-local
+  ;; pending marker still lets us revisit and render the completed block.
+  (agent-shell-math-renderer-tests--enabled
+    (with-temp-buffer
+      (insert "\\[\nx\n\\]\nafter")
+      (setq agent-shell-math-renderer--open-block-start
+            (copy-marker (point-min)))
+      (let (calls)
+        (cl-letf (((symbol-function 'agent-shell-math-renderer--apply-region)
+                   (lambda (&rest args) (push args calls))))
+          (save-restriction
+            (narrow-to-region (save-excursion
+                                (goto-char (point-min))
+                                (search-forward "after")
+                                (match-beginning 0))
+                              (point-max))
+            (agent-shell-math-renderer--render-hook
+             '((:source-blocks . nil) (:inline-code-ranges . nil)))))
+        (should (= (length calls) 1))
+        (should (eq (caar calls) (current-buffer)))
+        (should (= (cadar calls) (point-min)))
+        (should (equal (nth 3 (car calls)) "x"))
+        (should-not agent-shell-math-renderer--open-block-start)))))
+
+(ert-deftest agent-shell-math-renderer-refresh-recovers-unrendered-block ()
+  ;; Existing buffers can contain a completed display block that was frozen
+  ;; while streaming but never received `agent-shell-math-renderer-source'.
+  ;; Refresh should claim it, not only revisit already-rendered equations.
+  (agent-shell-math-renderer-tests--enabled
+    (with-temp-buffer
+      (insert "\\[\nx\n\\]\n")
+      (put-text-property (point-min) (1- (point-max))
+                         'agent-shell-markdown-frozen t)
+      (put-text-property (point-min) (1- (point-max)) 'read-only t)
+      (let (calls)
+        (cl-letf (((symbol-function 'agent-shell-math-renderer--render)
+                   (lambda (&rest args) (push args calls))))
+          (agent-shell-math-renderer--refresh-buffer (current-buffer)))
+        (should (= (length calls) 1))
+        (should (eq (caar calls) (current-buffer)))
+        (should (= (cadar calls) (point-min)))
+        (should (equal (nth 3 (car calls)) "x"))
+        (should (equal (get-text-property (point-min)
+                                          'agent-shell-math-renderer-source)
+                       "x"))))))
+
 (ert-deftest agent-shell-math-renderer-cache-key-distinguishes-inputs ()
   ;; The content key must be stable for identical inputs and differ when the
   ;; equation changes — otherwise cached SVGs collide or never hit.  (Pure

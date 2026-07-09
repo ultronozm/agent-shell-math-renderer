@@ -303,6 +303,9 @@ without `agent-shell.el'; set this variable there (or stub
 (defvar agent-shell-math-renderer--pending (make-hash-table :test 'equal)
   "In-memory map of cache key to regions awaiting an in-flight compile.")
 
+(defvar agent-shell-math-renderer--failed (make-hash-table :test 'equal)
+  "In-memory set of cache keys whose LaTeX compile has already failed.")
+
 (defvar-local agent-shell-math-renderer--rendered-appearance nil
   "The appearance signature this buffer's equations were rendered for.
 A list (FOREGROUND BACKGROUND FONT-HEIGHT) — see
@@ -316,6 +319,14 @@ an equation renders.")
 (defvar-local agent-shell-math-renderer--present nil
   "Non-nil in a buffer that has rendered display-math regions.
 Lets `agent-shell-math-renderer-refresh' visit only relevant buffers.")
+
+(defvar-local agent-shell-math-renderer--open-block-start nil
+  "Marker for a display-math opener that was frozen while streaming.
+
+This is a belt-and-suspenders recovery path for agent-shell's incremental
+watermarking: if a later markdown pass is narrowed after this opener, the
+renderer can still revisit the pending block once its closing delimiter has
+arrived.")
 
 (defun agent-shell-math-renderer--current-colors ()
   "Return the (FOREGROUND . BACKGROUND) equations should render for now.
@@ -548,6 +559,67 @@ forwarded."
             (cons (plist-get span :start) (plist-get span :end)))
           (agent-shell-math-renderer--inline-spans avoid-ranges)))
 
+(defun agent-shell-math-renderer--remember-open-block (start)
+  "Remember START as a still-streaming display-math opener."
+  (let ((pos (if (markerp start) (marker-position start) start)))
+    (when pos
+      (if (markerp agent-shell-math-renderer--open-block-start)
+          (set-marker agent-shell-math-renderer--open-block-start pos)
+        (setq agent-shell-math-renderer--open-block-start
+              (copy-marker pos))))))
+
+(defun agent-shell-math-renderer--clear-open-block (&optional start)
+  "Forget the pending display-math opener.
+When START is non-nil, clear it only if it matches the remembered opener."
+  (when (and (markerp agent-shell-math-renderer--open-block-start)
+             (or (not start)
+                 (equal (marker-position agent-shell-math-renderer--open-block-start)
+                        (if (markerp start) (marker-position start) start))))
+    (set-marker agent-shell-math-renderer--open-block-start nil)
+    (setq agent-shell-math-renderer--open-block-start nil)))
+
+(defun agent-shell-math-renderer--recover-open-block ()
+  "Render a remembered display block if its closer has arrived.
+
+Return non-nil when a pending block was completed and rendered.  This widens
+temporarily because the current markdown pass may be narrowed to text that
+arrived after the opener."
+  (when-let* ((marker agent-shell-math-renderer--open-block-start)
+              ((markerp marker))
+              (start (marker-position marker)))
+    (save-restriction
+      (widen)
+      (if (not (and (<= (point-min) start) (< start (point-max))))
+          (progn
+            (agent-shell-math-renderer--clear-open-block)
+            nil)
+        (save-excursion
+          (save-restriction
+            (narrow-to-region start (point-max))
+            (let ((block (seq-find
+                          (lambda (candidate)
+                            (= (plist-get candidate :start) start))
+                          (agent-shell-math-renderer--blocks []))))
+              (cond
+               ((and block (> (plist-get block :close) 0))
+                (let* ((end (plist-get block :end))
+                       (latex (string-trim
+                               (buffer-substring-no-properties
+                                (+ start (plist-get block :open))
+                                (- end (plist-get block :close))))))
+                  (if (or (string-empty-p latex)
+                          (get-text-property start
+                                             'agent-shell-math-renderer-source))
+                      (agent-shell-math-renderer--clear-open-block start)
+                    (agent-shell-math-renderer--apply-region
+                     (current-buffer) start end latex)
+                    (agent-shell-math-renderer--clear-open-block start)
+                    t)))
+               (block nil)
+               (t
+                (agent-shell-math-renderer--clear-open-block start)
+                nil)))))))))
+
 (cl-defun agent-shell-math-renderer--style-inline (&key avoid-ranges)
   "Overlay inline-math spans `\\(...\\)' with a text-style equation image.
 
@@ -632,7 +704,8 @@ place, faced `agent-shell-math-renderer' and frozen."
                          (+ start (plist-get block :open))
                          (- end close))))
                 ((not (string-empty-p latex))))
-      (agent-shell-math-renderer--apply-region (current-buffer) start end latex))))
+      (agent-shell-math-renderer--apply-region (current-buffer) start end latex)
+      (agent-shell-math-renderer--clear-open-block start))))
 
 (defun agent-shell-math-renderer--fence-language-p (lang)
   "Return non-nil if fenced-block language LANG renders as display math.
@@ -667,14 +740,16 @@ delimiters — and passes START..END over that `\\[...\\]' text, so all three
 callers hand this function a delimited (LaTeX-renderable) region."
   (with-current-buffer buffer
     (setq agent-shell-math-renderer--present t)
-    (add-face-text-property start end 'agent-shell-math-renderer)
-    (add-text-properties
-     start end
-     `(help-echo ,latex
-                 agent-shell-math-renderer-source ,latex
-                 agent-shell-math-renderer-inline ,inline
-                 agent-shell-markdown-frozen t
-                 rear-nonsticky (agent-shell-markdown-frozen)))
+    (let ((inhibit-read-only t))
+      (with-silent-modifications
+        (add-face-text-property start end 'agent-shell-math-renderer)
+        (add-text-properties
+         start end
+         `(help-echo ,latex
+                     agent-shell-math-renderer-source ,latex
+                     agent-shell-math-renderer-inline ,inline
+                     agent-shell-markdown-frozen t
+                     rear-nonsticky (agent-shell-markdown-frozen)))))
     (agent-shell-math-renderer--render buffer start end latex inline)))
 
 (defun agent-shell-math-renderer--svg-color (face attribute fallback)
@@ -892,7 +967,7 @@ No-ops when BUFFER is dead or the region is no longer valid (it
 was edited or killed away).  Runs with `with-silent-modifications'
 so an async overlay doesn't flag the buffer modified, and carries
 the region's existing `line-prefix' / `wrap-prefix' so indentation
-is preserved."
+is preserved.  Return non-nil when the image was installed."
   (when (and image (buffer-live-p buffer))
     (with-current-buffer buffer
       (let ((s (if (markerp start) (marker-position start) start))
@@ -906,7 +981,71 @@ is preserved."
               (when line-prefix
                 (put-text-property s e 'line-prefix line-prefix))
               (when wrap-prefix
-                (put-text-property s e 'wrap-prefix wrap-prefix)))))))))
+                (put-text-property s e 'wrap-prefix wrap-prefix))
+              t)))))))
+
+(defun agent-shell-math-renderer--inline-equal-p (a b)
+  "Return non-nil if A and B represent the same inline/display mode."
+  (eq (not (not a)) (not (not b))))
+
+(defun agent-shell-math-renderer--source-region-p (start end latex inline)
+  "Return non-nil if START..END still carries LATEX and INLINE metadata."
+  (and (not (text-property-not-all
+             start end 'agent-shell-math-renderer-source latex))
+       (let ((pos start)
+             (same t))
+         (while (and same (< pos end))
+           (setq same
+                 (agent-shell-math-renderer--inline-equal-p
+                  (get-text-property pos 'agent-shell-math-renderer-inline)
+                  inline))
+           (setq pos (or (next-single-property-change
+                          pos 'agent-shell-math-renderer-inline nil end)
+                         end)))
+         same)))
+
+(defun agent-shell-math-renderer--overlay-image-if-source
+    (buffer start end latex inline image)
+  "Overlay IMAGE only if BUFFER's START..END is still LATEX math."
+  (when (and image (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (let ((s (if (markerp start) (marker-position start) start))
+            (e (if (markerp end) (marker-position end) end)))
+        (when (and s e (<= (point-min) s) (< s e) (<= e (point-max))
+                   (agent-shell-math-renderer--source-region-p s e latex inline))
+          (agent-shell-math-renderer--overlay-image buffer s e image))))))
+
+(defun agent-shell-math-renderer--overlay-matching-source-regions
+    (buffer latex inline image)
+  "Overlay IMAGE on stale BUFFER regions carrying LATEX and INLINE metadata.
+
+This recovers async compiles whose original marker range was invalidated by
+later markdown rewrites.  The source text properties are copied by those
+rewrites, while the markers used for the pending compile may collapse into
+the edited range."
+  (when (and image (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (let ((pos (point-min))
+            (installed nil))
+        (while (setq pos (text-property-not-all
+                          pos (point-max)
+                          'agent-shell-math-renderer-source nil))
+          (let* ((end (or (next-single-property-change
+                           pos 'agent-shell-math-renderer-source nil (point-max))
+                          (point-max)))
+                 (source (get-text-property
+                          pos 'agent-shell-math-renderer-source))
+                 (region-inline (get-text-property
+                                 pos 'agent-shell-math-renderer-inline)))
+            (when (and (equal source latex)
+                       (agent-shell-math-renderer--inline-equal-p region-inline inline)
+                       (not (get-text-property pos 'display)))
+              (setq installed
+                    (or (agent-shell-math-renderer--overlay-image
+                         buffer pos end image)
+                        installed)))
+            (setq pos end)))
+        installed))))
 
 (defun agent-shell-math-renderer--render (buffer start end latex &optional inline)
   "Render LATEX over BUFFER's START..END as an equation image.
@@ -943,9 +1082,10 @@ time."
                (image (agent-shell-math-renderer--cached-image key)))
           (if image
               (agent-shell-math-renderer--overlay-image buffer start end image)
-            (agent-shell-math-renderer--schedule
-             key latex buffer
-             (copy-marker start) (copy-marker end) inline))))))))
+            (unless (gethash key agent-shell-math-renderer--failed)
+              (agent-shell-math-renderer--schedule
+               key latex buffer
+               (copy-marker start) (copy-marker end) inline)))))))))
 
 (defun agent-shell-math-renderer--schedule (key latex
                                                 buffer start end &optional inline)
@@ -1060,9 +1200,12 @@ portable; it can slot in here without changing callers."
                            (end (nth 2 region)))
                        (when (buffer-live-p buffer)
                          (with-current-buffer buffer
-                           (agent-shell-math-renderer--overlay-image
-                            buffer start end
-                            (agent-shell-math-renderer--cached-image key))))))
+                           (let ((image (agent-shell-math-renderer--cached-image key)))
+                             (unless (agent-shell-math-renderer--overlay-image-if-source
+                                      buffer start end latex inline image)
+                               (agent-shell-math-renderer--overlay-matching-source-regions
+                                buffer latex inline image)))))))
+                 (puthash key t agent-shell-math-renderer--failed)
                  (agent-shell-math-renderer--compile-failed key latex dir))
                (remhash key agent-shell-math-renderer--pending)
                (funcall cleanup))))
@@ -1071,6 +1214,34 @@ portable; it can slot in here without changing callers."
          (remhash key agent-shell-math-renderer--pending)
          (funcall cleanup)
          (signal (car err) (cdr err)))))))
+
+(defun agent-shell-math-renderer--property-ranges (property)
+  "Return sorted ranges where text property PROPERTY is non-nil."
+  (let ((ranges '())
+        (pos (point-min))
+        (limit (point-max)))
+    (while (< pos limit)
+      (if (get-text-property pos property)
+          (let ((end (or (next-single-property-change
+                          pos property nil limit)
+                         limit)))
+            (push (cons pos end) ranges)
+            (setq pos end))
+        (setq pos (or (next-single-property-change pos property nil limit)
+                      limit))))
+    (agent-shell-markdown-sort-ranges (nreverse ranges))))
+
+(defun agent-shell-math-renderer--recover-unrendered-blocks ()
+  "Claim complete display-math blocks that have not received a source tag.
+
+This is used by refresh as a repair pass for buffers left with a frozen
+streaming display block whose closer later arrived outside the renderer's
+narrowed scan region.  Rendered source-block bodies are avoided so literal
+LaTeX examples in code stay untouched."
+  (agent-shell-math-renderer--style-blocks
+   :avoid-ranges
+   (agent-shell-math-renderer--property-ranges
+    'agent-shell-markdown-source-block-body)))
 
 (defun agent-shell-math-renderer--refresh-buffer (buffer)
   "Re-render every display-math region in BUFFER for the current colors.
@@ -1093,7 +1264,9 @@ is reused from cache)."
                             pos 'agent-shell-math-renderer-source nil (point-max))
                            (point-max))))
               (agent-shell-math-renderer--render buffer pos end latex inline)
-              (setq pos end))))))))
+              (setq pos end)))))
+      (agent-shell-math-renderer--recover-open-block)
+      (agent-shell-math-renderer--recover-unrendered-blocks))))
 
 (defun agent-shell-math-renderer-refresh (&optional buffer)
   "Re-render displayed equations for the current colors and font.
@@ -1217,9 +1390,12 @@ needs streaming protection, nil otherwise."
                      source-blocks)))
            (watermark nil))
       (agent-shell-math-renderer--style-blocks :avoid-ranges source-ranges)
+      (agent-shell-math-renderer--recover-open-block)
       (let ((open-block (seq-find (lambda (b) (zerop (plist-get b :close)))
                                   (agent-shell-math-renderer--blocks source-ranges))))
         (when open-block
+          (agent-shell-math-renderer--remember-open-block
+           (plist-get open-block :start))
           (setq watermark (plist-get open-block :start))
           (put-text-property (plist-get open-block :start) (plist-get open-block :end)
                              'agent-shell-markdown-frozen t)))
