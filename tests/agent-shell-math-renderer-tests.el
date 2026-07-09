@@ -448,7 +448,13 @@ E=mc^2
             (copy-marker (point-min)))
       (let (calls)
         (cl-letf (((symbol-function 'agent-shell-math-renderer--apply-region)
-                   (lambda (&rest args) (push args calls))))
+                   (lambda (buffer start end latex &optional inline)
+                     (with-current-buffer buffer
+                       (put-text-property
+                        start end 'agent-shell-math-renderer-source latex)
+                       (put-text-property
+                        start end 'agent-shell-math-renderer-inline inline))
+                     (push (list buffer start end latex inline) calls))))
           (save-restriction
             (narrow-to-region (save-excursion
                                 (goto-char (point-min))
@@ -462,6 +468,41 @@ E=mc^2
         (should (= (cadar calls) (point-min)))
         (should (equal (nth 3 (car calls)) "x"))
         (should-not agent-shell-math-renderer--open-block-start)))))
+
+(ert-deftest agent-shell-math-renderer-render-hook-recovers-stale-block-without-marker ()
+  ;; Existing streamed output can already be in the bad state before this
+  ;; package version is loaded: the opener/body were frozen as a streaming
+  ;; display block, the closer later arrived, but no pending marker survived.
+  ;; A later render hook call narrowed after the block should still repair it.
+  (agent-shell-math-renderer-tests--enabled
+    (with-temp-buffer
+      (insert "\\[\nx\n\\]\nafter")
+      (put-text-property (point-min) (save-excursion
+                                       (goto-char (point-min))
+                                       (forward-line 2)
+                                       (point))
+                         'agent-shell-markdown-frozen t)
+      (let (calls)
+        (cl-letf (((symbol-function 'agent-shell-math-renderer--apply-region)
+                   (lambda (buffer start end latex &optional inline)
+                     (with-current-buffer buffer
+                       (put-text-property
+                        start end 'agent-shell-math-renderer-source latex)
+                       (put-text-property
+                        start end 'agent-shell-math-renderer-inline inline))
+                     (push (list buffer start end latex inline) calls))))
+          (save-restriction
+            (narrow-to-region (save-excursion
+                                (goto-char (point-min))
+                                (search-forward "after")
+                                (match-beginning 0))
+                              (point-max))
+            (agent-shell-math-renderer--render-hook
+             '((:source-blocks . nil) (:inline-code-ranges . nil)))))
+        (should (= (length calls) 1))
+        (should (eq (caar calls) (current-buffer)))
+        (should (= (cadar calls) (point-min)))
+        (should (equal (nth 3 (car calls)) "x"))))))
 
 (ert-deftest agent-shell-math-renderer-refresh-recovers-unrendered-block ()
   ;; Existing buffers can contain a completed display block that was frozen

@@ -1231,17 +1231,23 @@ portable; it can slot in here without changing callers."
                       limit))))
     (agent-shell-markdown-sort-ranges (nreverse ranges))))
 
-(defun agent-shell-math-renderer--recover-unrendered-blocks ()
+(defun agent-shell-math-renderer--recover-unrendered-blocks (&optional avoid-ranges)
   "Claim complete display-math blocks that have not received a source tag.
 
 This is used by refresh as a repair pass for buffers left with a frozen
 streaming display block whose closer later arrived outside the renderer's
 narrowed scan region.  Rendered source-block bodies are avoided so literal
-LaTeX examples in code stay untouched."
-  (agent-shell-math-renderer--style-blocks
-   :avoid-ranges
-   (agent-shell-math-renderer--property-ranges
-    'agent-shell-markdown-source-block-body)))
+LaTeX examples in code stay untouched.  AVOID-RANGES, when non-nil, are
+additional protected ranges such as fenced source blocks known to the
+current render hook call."
+  (save-restriction
+    (widen)
+    (agent-shell-math-renderer--style-blocks
+     :avoid-ranges
+     (agent-shell-markdown-sort-ranges
+      avoid-ranges
+      (agent-shell-math-renderer--property-ranges
+       'agent-shell-markdown-source-block-body)))))
 
 (defun agent-shell-math-renderer--refresh-buffer (buffer)
   "Re-render every display-math region in BUFFER for the current colors.
@@ -1391,6 +1397,7 @@ needs streaming protection, nil otherwise."
            (watermark nil))
       (agent-shell-math-renderer--style-blocks :avoid-ranges source-ranges)
       (agent-shell-math-renderer--recover-open-block)
+      (agent-shell-math-renderer--recover-unrendered-blocks source-ranges)
       (let ((open-block (seq-find (lambda (b) (zerop (plist-get b :close)))
                                   (agent-shell-math-renderer--blocks source-ranges))))
         (when open-block
